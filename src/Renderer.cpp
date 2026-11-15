@@ -297,7 +297,8 @@ void Renderer::CreateModelDescriptorSets() {
         throw std::runtime_error("Failed to allocate descriptor set");
     }
 
-    std::vector<VkWriteDescriptorSet> descriptorWrites(2 * modelDescriptorSets.size());
+    std::vector<VkWriteDescriptorSet> descriptorWrites;
+    descriptorWrites.reserve(2 * modelDescriptorSets.size());
     // the writes point into these, so they must outlive the loop
     std::vector<VkDescriptorBufferInfo> bufferInfos(modelDescriptorSets.size());
     std::vector<VkDescriptorImageInfo> imageInfos(modelDescriptorSets.size());
@@ -308,29 +309,36 @@ void Renderer::CreateModelDescriptorSets() {
         modelBufferInfo.offset = 0;
         modelBufferInfo.range = sizeof(ModelBufferObject);
 
+        VkWriteDescriptorSet bufferWrite = {};
+        bufferWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        bufferWrite.dstSet = modelDescriptorSets[i];
+        bufferWrite.dstBinding = 0;
+        bufferWrite.dstArrayElement = 0;
+        bufferWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        bufferWrite.descriptorCount = 1;
+        bufferWrite.pBufferInfo = &modelBufferInfo;
+        descriptorWrites.push_back(bufferWrite);
+
+        // untextured models leave binding 1 unwritten; their shaders never read it
+        if (scene->GetModels()[i]->GetTextureView() == VK_NULL_HANDLE) {
+            continue;
+        }
+
         // Bind image and sampler resources to the descriptor
         VkDescriptorImageInfo& imageInfo = imageInfos[i];
         imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         imageInfo.imageView = scene->GetModels()[i]->GetTextureView();
         imageInfo.sampler = scene->GetModels()[i]->GetTextureSampler();
 
-        descriptorWrites[2 * i + 0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        descriptorWrites[2 * i + 0].dstSet = modelDescriptorSets[i];
-        descriptorWrites[2 * i + 0].dstBinding = 0;
-        descriptorWrites[2 * i + 0].dstArrayElement = 0;
-        descriptorWrites[2 * i + 0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        descriptorWrites[2 * i + 0].descriptorCount = 1;
-        descriptorWrites[2 * i + 0].pBufferInfo = &modelBufferInfo;
-        descriptorWrites[2 * i + 0].pImageInfo = nullptr;
-        descriptorWrites[2 * i + 0].pTexelBufferView = nullptr;
-
-        descriptorWrites[2 * i + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        descriptorWrites[2 * i + 1].dstSet = modelDescriptorSets[i];
-        descriptorWrites[2 * i + 1].dstBinding = 1;
-        descriptorWrites[2 * i + 1].dstArrayElement = 0;
-        descriptorWrites[2 * i + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        descriptorWrites[2 * i + 1].descriptorCount = 1;
-        descriptorWrites[2 * i + 1].pImageInfo = &imageInfo;
+        VkWriteDescriptorSet imageWrite = {};
+        imageWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        imageWrite.dstSet = modelDescriptorSets[i];
+        imageWrite.dstBinding = 1;
+        imageWrite.dstArrayElement = 0;
+        imageWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        imageWrite.descriptorCount = 1;
+        imageWrite.pImageInfo = &imageInfo;
+        descriptorWrites.push_back(imageWrite);
     }
 
     // Update descriptor sets
@@ -411,7 +419,6 @@ void Renderer::CreateTimeDescriptorSet() {
 
 // an instance of the Layout defined earlier
 void Renderer::CreateComputeDescriptorSets() {
-    // one set per group of blades, pointing at that group's three storage buffers
     computeDescriptorSets.resize(scene->GetBlades().size());
 
     std::vector<VkDescriptorSetLayout> layouts(computeDescriptorSets.size(), computeDescriptorSetLayout);
@@ -984,7 +991,7 @@ void Renderer::RecordComputeCommandBuffer() {
         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 1, &frameBarrier, 0, nullptr, 0, nullptr);
 
-    // zero vertexCount (first field of BladeDrawIndirect) so the shader's atomicAdd starts at slot 0
+    // zero vertexCount, the first field of BladeDrawIndirect
     for (uint32_t i = 0; i < scene->GetBlades().size(); ++i) {
         vkCmdFillBuffer(computeCommandBuffer, scene->GetBlades()[i]->GetNumBladesBuffer(), 0, sizeof(uint32_t), 0);
     }
@@ -1058,7 +1065,6 @@ void Renderer::RecordCommandBuffers() {
             barriers[2 * j].offset = 0;
             barriers[2 * j].size = sizeof(BladeDrawIndirect);
 
-            // the culled blades are this draw's vertex buffer
             barriers[2 * j + 1] = barriers[2 * j];
             barriers[2 * j + 1].dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
             barriers[2 * j + 1].buffer = scene->GetBlades()[j]->GetCulledBladesBuffer();

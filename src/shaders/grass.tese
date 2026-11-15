@@ -18,7 +18,7 @@ out gl_PerVertex {
 };
 
 layout(location = 0) in vec4 inV0[];
-layout(location = 1) in vec4 inV1[];z
+layout(location = 1) in vec4 inV1[];
 layout(location = 2) in vec4 inV2[];
 layout(location = 3) in vec4 inUp[];
 

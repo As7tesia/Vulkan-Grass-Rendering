@@ -12,7 +12,6 @@ layout(set = 0, binding = 0) uniform CameraBufferObject {
 #define TESS_WIDTH 2.0
 #define TESS_HEIGHT 8.0
 
-// TODO: Declare tessellation control shader inputs and outputs
 in gl_PerVertex {
     vec4 gl_Position;
 } gl_in[gl_MaxPatchVertices];
@@ -35,13 +34,11 @@ void main() {
 	// Don't move the origin location of the patch
     gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;
 
-	// TODO: Write any shader outputs
 	outV0[gl_InvocationID] = inV0[gl_InvocationID];
 	outV1[gl_InvocationID] = inV1[gl_InvocationID];
 	outV2[gl_InvocationID] = inV2[gl_InvocationID];
 	outUp[gl_InvocationID] = inUp[gl_InvocationID];
 
-	// TODO: Set level of tesselation
 	// quads: outer[0] and [2] are the u = 0 and u = 1 edges (split along v), outer[1] and [3] the v = 0 and v = 1 edges
 	gl_TessLevelInner[0] = TESS_WIDTH;
 	gl_TessLevelInner[1] = TESS_HEIGHT;

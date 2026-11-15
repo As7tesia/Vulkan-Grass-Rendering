@@ -21,22 +21,6 @@ struct Blade {
     vec4 up;
 };
 
-// TODO: Add bindings to:
-// 1. Store the input blades
-// 2. Write out the culled blades
-// 3. Write the total number of blades remaining
-
-// The project is using vkCmdDrawIndirect to use a buffer as the arguments for a draw call
-// This is sort of an advanced feature so we've showed you what this buffer should look like
-//
-// layout(set = ???, binding = ???) buffer NumBlades {
-// 	  uint vertexCount;   // Write the number of blades remaining here
-// 	  uint instanceCount; // = 1
-// 	  uint firstVertex;   // = 0
-// 	  uint firstInstance; // = 0
-// } numBlades;
-
-
 layout(set = 2, binding = 0, std430) buffer AllBlades {
     Blade blades[];
 };
@@ -55,8 +39,24 @@ layout(set = 2, binding = 2, std430) buffer NumBlades {
 #define GRAVITY 9.8
 #define WIND_STRENGTH 6.0
 
+// set to 0 to turn a test off
+#define ORIENTATION_CULLING 1
+#define FRUSTUM_CULLING 1
+#define DISTANCE_CULLING 1
+
+#define ORIENTATION_THRESHOLD 0.9
+#define FRUSTUM_TOLERANCE 0.1
+#define MAX_DISTANCE 30.0
+#define DISTANCE_BUCKETS 10
+
 bool inBounds(float value, float bounds) {
     return (value >= -bounds) && (value <= bounds);
+}
+
+bool inFrustum(vec3 p, mat4 viewProj) {
+    vec4 clip = viewProj * vec4(p, 1.0);
+    float h = clip.w * (1.0 + FRUSTUM_TOLERANCE);
+    return inBounds(clip.x, h) && inBounds(clip.y, h) && inBounds(clip.z, h);
 }
 
 // layered sines; frequencies are non-multiples of each other so the sum doesn't visibly repeat
@@ -129,10 +129,31 @@ void main() {
 	blade.v2.xyz = v2;
 	blades[index] = blade;
 
-	// TODO: Cull blades that are too far away or not in the camera frustum and write them
-	// to the culled blades buffer
-	// Note: to do this, you will need to use an atomic operation to read and update numBlades.vertexCount
-	// You want to write the visible blades to the buffer without write conflicts between threads
-	// placeholder until culling: keep every blade
-	culledBlades[atomicAdd(numBlades.vertexCount, 1)] = blade;
+	// view is rigid, so its inverse translation is -R^T * t
+	vec3 cameraPosition = -transpose(mat3(camera.view)) * camera.view[3].xyz;
+	bool visible = true;
+
+#if ORIENTATION_CULLING
+	// edge-on: looking along the width direction
+	vec3 viewDirection = normalize(v0 - cameraPosition);
+	visible = visible && abs(dot(viewDirection, t1)) < ORIENTATION_THRESHOLD;
+#endif
+
+#if FRUSTUM_CULLING
+	mat4 viewProj = camera.proj * camera.view;
+	vec3 midpoint = 0.25 * v0 + 0.5 * v1 + 0.25 * v2;
+	visible = visible && (inFrustum(v0, viewProj) || inFrustum(midpoint, viewProj) || inFrustum(v2, viewProj));
+#endif
+
+#if DISTANCE_CULLING
+	// keep fewer buckets of blades as ground-plane distance grows, none past MAX_DISTANCE
+	vec3 toBlade = v0 - cameraPosition;
+	float groundDistance = length(toBlade - up * dot(toBlade, up));
+	float keptBuckets = floor(DISTANCE_BUCKETS * (1.0 - groundDistance / MAX_DISTANCE));
+	visible = visible && float(index % DISTANCE_BUCKETS) <= keptBuckets;
+#endif
+
+	if (visible) {
+		culledBlades[atomicAdd(numBlades.vertexCount, 1)] = blade;
+	}
 }

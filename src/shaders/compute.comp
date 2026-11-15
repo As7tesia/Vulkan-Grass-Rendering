@@ -1,5 +1,6 @@
 #version 450
 #extension GL_ARB_separate_shader_objects : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
 
 #define WORKGROUP_SIZE 32
 layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
@@ -39,7 +40,8 @@ layout(set = 2, binding = 2, std430) buffer NumBlades {
 #define GRAVITY 9.8
 #define WIND_STRENGTH 6.0
 
-// set to 0 to turn a test off
+// set to 0 to turn a feature off
+#define SUBGROUP_COMPACTION 1   // warp aggregated atomic ballot
 #define ORIENTATION_CULLING 1
 #define FRUSTUM_CULLING 1
 #define DISTANCE_CULLING 1
@@ -153,7 +155,20 @@ void main() {
 	visible = visible && float(index % DISTANCE_BUCKETS) <= keptBuckets;
 #endif
 
+#if SUBGROUP_COMPACTION
+	// one atomic per subgroup: the first lane reserves room for every visible lane
+	uvec4 ballot = subgroupBallot(visible);
+	uint base = 0;
+	if (subgroupElect()) {
+		base = atomicAdd(numBlades.vertexCount, subgroupBallotBitCount(ballot));
+	}
+	base = subgroupBroadcastFirst(base);
+	if (visible) {
+		culledBlades[base + subgroupBallotExclusiveBitCount(ballot)] = blade;
+	}
+#else
 	if (visible) {
 		culledBlades[atomicAdd(numBlades.vertexCount, 1)] = blade;
 	}
+#endif
 }

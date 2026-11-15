@@ -59,6 +59,23 @@ bool inBounds(float value, float bounds) {
     return (value >= -bounds) && (value <= bounds);
 }
 
+// layered sines; frequencies are non-multiples of each other so the sum doesn't visibly repeat
+void windAt(vec2 p, float t, out vec3 direction, out float strength) {
+    float angle = 0.3 + 0.4 * sin(0.13 * t) + 0.2 * sin(0.31 * t + 1.7);
+    vec2 baseDir = vec2(cos(angle), sin(angle));
+
+    // gust fronts traveling along three directions, weights sum to 1
+    float gust = 0.5 * sin(0.35 * dot(p, baseDir) - 2.1 * t)
+               + 0.3 * sin(0.9 * dot(p, vec2(0.8, -0.6)) - 3.7 * t + 1.3)
+               + 0.2 * sin(2.3 * dot(p, vec2(-0.3, 0.95)) - 5.9 * t + 4.1);
+    float envelope = 0.65 + 0.35 * sin(0.27 * t) * cos(0.11 * t + 0.6);
+    strength = WIND_STRENGTH * envelope * (0.55 + 0.45 * gust);
+
+    float flutter = 0.25 * sin(dot(p, vec2(1.7, 1.1)) - 4.3 * t);
+    vec2 dir = normalize(baseDir + flutter * vec2(-baseDir.y, baseDir.x));
+    direction = vec3(dir.x, 0.0, dir.y);
+}
+
 void main() {
 	// vertexCount is zeroed by vkCmdFillBuffer before this dispatch
 	uint index = gl_GlobalInvocationID.x;
@@ -85,8 +102,9 @@ void main() {
 
 	vec3 recovery = (v0 + up * height - v2) * stiffness;
 
-	vec3 windDirection = normalize(vec3(1.0, 0.0, 0.3));
-	float windStrength = WIND_STRENGTH * (0.6 + 0.4 * sin(2.0 * totalTime + dot(v0.xz, vec2(0.4, 0.15))));
+	vec3 windDirection;
+	float windStrength;
+	windAt(v0.xz, totalTime, windDirection, windStrength);
 	float directionalAlignment = 1.0 - abs(dot(windDirection, normalize(v2 - v0)));
 	float heightRatio = dot(v2 - v0, up) / height;
 	vec3 wind = windDirection * windStrength * directionalAlignment * heightRatio;

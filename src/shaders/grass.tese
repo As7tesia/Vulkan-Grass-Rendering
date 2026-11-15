@@ -35,7 +35,7 @@ void main() {
     float orientation = inV0[0].w;
     float width = inV2[0].w;
 
-    // de Casteljau: c is the point on the curve at height v (paper section 6.3)
+    // de Casteljau: c is the point on the curve at height v
     vec3 a = mix(v0, v1, v);
     vec3 b = mix(v1, v2, v);
     vec3 c = mix(a, b, v);

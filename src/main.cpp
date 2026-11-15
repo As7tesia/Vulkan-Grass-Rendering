@@ -67,7 +67,9 @@ namespace {
 
 int main() {
     static constexpr char* applicationName = "Vulkan Grass Rendering";
-    InitializeWindow(640, 480, applicationName);
+    static constexpr int windowWidth = 1920;
+    static constexpr int windowHeight = 1080;
+    InitializeWindow(windowWidth, windowHeight, applicationName);
 
     unsigned int glfwExtensionCount = 0;
     const char** glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
@@ -90,7 +92,7 @@ int main() {
 
     swapChain = device->CreateSwapChain(surface, 5);
 
-    camera = new Camera(device, 640.f / 480.f);
+    camera = new Camera(device, static_cast<float>(windowWidth) / windowHeight);
 
     VkCommandPoolCreateInfo transferPoolInfo = {};
     transferPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;

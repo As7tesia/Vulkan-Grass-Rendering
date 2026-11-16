@@ -68,9 +68,19 @@ void Camera::SetHome(const glm::vec3& eye, const glm::vec3& target) {
     ResetToHome();
 }
 
+void Camera::SetHome(const ViewportPose& home) {
+    homePose = home;
+    homePose.pitch = glm::clamp(homePose.pitch, -PITCH_LIMIT, PITCH_LIMIT);
+    ResetToHome();
+}
+
 void Camera::ResetToHome() {
     pose = homePose;
     UpdateView();
+}
+
+const ViewportPose& Camera::GetPose() const {
+    return pose;
 }
 
 void Camera::SetFlySpeed(float unitsPerSecond) {

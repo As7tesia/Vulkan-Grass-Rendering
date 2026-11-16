@@ -1,4 +1,7 @@
 #include <algorithm>
+#include <cstdio>
+#include <string>
+#include <vector>
 #include <vulkan/vulkan.h>
 #include "Instance.h"
 #include "Window.h"
@@ -6,6 +9,7 @@
 #include "Camera.h"
 #include "Scene.h"
 #include "Terrain.h"
+#include "Options.h"
 
 Device* device;
 SwapChain* swapChain;
@@ -17,6 +21,7 @@ namespace {
     const float SECONDS_TO_CROSS_TERRAIN = 8.0f;
     // the longest fly step a stalled frame may take
     const float MAX_FRAME_SECONDS = 0.25f;
+    const float FIXED_STEP_SECONDS = 1.0f / 60.0f;
 
     bool leftMouseDown = false;
     bool rightMouseDown = false;
@@ -57,6 +62,9 @@ namespace {
         // not while flying, where F sits next to the movement keys
         else if (key == GLFW_KEY_F && !rightMouseDown) {
             camera->ResetToHome();
+        }
+        else if (key == GLFW_KEY_P && !rightMouseDown) {
+            fprintf(stderr, "--pose %s\n", FormatPose(camera->GetPose()).c_str());
         }
     }
 
@@ -110,9 +118,97 @@ namespace {
             camera->MoveAlongView(static_cast<float>(yOffset));
         }
     }
+
+    double median(std::vector<double> values) {
+        std::sort(values.begin(), values.end());
+        size_t n = values.size();
+        return n % 2 ? values[n / 2] : 0.5 * (values[n / 2 - 1] + values[n / 2]);
+    }
+
+    // returns false if the window was closed
+    bool runFrames(Scene* scene, int count) {
+        for (int i = 0; i < count; ++i) {
+            if (ShouldQuit()) {
+                return false;
+            }
+            glfwPollEvents();
+            scene->UpdateTime(FIXED_STEP_SECONDS);
+            renderer->Frame();
+        }
+        return true;
+    }
+
+    // one CSV row of median GPU pass times; presents are vsync-capped, so wall-clock frame time says nothing here
+    void runBench(Scene* scene, Blades* blades, const Options& options) {
+        if (!runFrames(scene, options.warmupFrames)) {
+            return;
+        }
+
+        std::vector<double> compute, terrain, grass, total;
+        for (int i = 0; i < options.timedFrames; ++i) {
+            if (!runFrames(scene, 1)) {
+                return;
+            }
+            vkDeviceWaitIdle(device->GetVkDevice());
+            GpuTimings t = renderer->ReadTimings();
+            compute.push_back(t.compute);
+            terrain.push_back(t.terrain);
+            grass.push_back(t.grass);
+            total.push_back(t.compute + t.terrain + t.grass);
+        }
+        uint32_t drawn = renderer->ReadDrawnBladeCount();
+
+        char row[512];
+        snprintf(row, sizeof(row), "\"%s\",%u,%d,%d,%d,%d,%d,0x%x,\"%s\",%u,%.4f,%.4f,%.4f,%.4f",
+            options.tag.c_str(), blades->GetCount(), options.subgroupCompaction, options.orientationCulling,
+            options.frustumCulling, options.distanceCulling, options.hostVisibleCulled, blades->GetCulledMemoryFlags(),
+            FormatPose(camera->GetPose()).c_str(), drawn, median(compute), median(terrain), median(grass), median(total));
+        const char* header = "tag,blades,compaction,orientation,frustum,distance,host_visible_culled,culled_memory_flags,"
+            "pose,drawn,compute_ms,terrain_ms,grass_ms,gpu_ms";
+
+        printf("%s\n%s\n", header, row);
+        if (!options.csvPath.empty()) {
+            FILE* file = fopen(options.csvPath.c_str(), "a+");
+            if (file == nullptr) {
+                throw std::runtime_error("Failed to open " + options.csvPath);
+            }
+            fseek(file, 0, SEEK_END);
+            if (ftell(file) == 0) {
+                fprintf(file, "%s\n", header);
+            }
+            fprintf(file, "%s\n", row);
+            fclose(file);
+        }
+    }
+
+    void runCapture(Scene* scene, const Options& options) {
+        if (!runFrames(scene, options.warmupFrames)) {
+            return;
+        }
+        if (!options.capturePath.empty()) {
+            glfwPollEvents();
+            scene->UpdateTime(FIXED_STEP_SECONDS);
+            renderer->Frame(options.capturePath.c_str());
+        }
+        for (int i = 0; i < options.recordFrames && !ShouldQuit(); ++i) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/frame_%04d.png", options.recordDir.c_str(), i);
+            glfwPollEvents();
+            scene->UpdateTime(FIXED_STEP_SECONDS);
+            renderer->Frame(path);
+        }
+    }
 }
 
-int main() {
+int main(int argc, char** argv) {
+    Options options;
+    try {
+        options = ParseOptions(argc, argv);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "%s\n", e.what());
+        return 1;
+    }
+
     static constexpr char* applicationName = "Vulkan Grass Rendering";
     static constexpr int windowWidth = 1920;
     static constexpr int windowHeight = 1080;
@@ -158,10 +254,14 @@ int main() {
     terrain.BuildMesh(terrainVertices, terrainIndices);
     Model* ground = new Model(device, transferCommandPool, terrainVertices, terrainIndices);
 
-    Blades* blades = new Blades(device, transferCommandPool, terrain);
+    Blades* blades = new Blades(device, transferCommandPool, terrain, options.blades, options.hostVisibleCulled);
 
     glm::vec3 center(0.0f, terrain.HeightAt(0.0f, 0.0f), 0.0f);
-    camera->SetHome(center + glm::vec3(0.0f, 11.0f, 28.0f), center);
+    if (options.hasPose) {
+        camera->SetHome(options.pose);
+    } else {
+        camera->SetHome(center + glm::vec3(0.0f, 11.0f, 28.0f), center);
+    }
     camera->SetFlySpeed(terrain.GetSize() / SECONDS_TO_CROSS_TERRAIN);
 
     vkDestroyCommandPool(device->GetVkDevice(), transferCommandPool, nullptr);
@@ -170,7 +270,7 @@ int main() {
     scene->AddModel(ground);
     scene->AddBlades(blades);
 
-    renderer = new Renderer(device, swapChain, scene, camera);
+    renderer = new Renderer(device, swapChain, scene, camera, options);
 
     glfwSetWindowSizeCallback(GetGLFWWindow(), resizeCallback);
     glfwSetMouseButtonCallback(GetGLFWWindow(), mouseDownCallback);
@@ -178,14 +278,20 @@ int main() {
     glfwSetScrollCallback(GetGLFWWindow(), scrollCallback);
     glfwSetKeyCallback(GetGLFWWindow(), keyCallback);
 
-    double lastFrameTime = glfwGetTime();
-    while (!ShouldQuit()) {
-        glfwPollEvents();
-        double now = glfwGetTime();
-        flyFromKeys(GetGLFWWindow(), static_cast<float>(std::min(now - lastFrameTime, static_cast<double>(MAX_FRAME_SECONDS))));
-        lastFrameTime = now;
-        scene->UpdateTime();
-        renderer->Frame();
+    if (options.bench) {
+        runBench(scene, blades, options);
+    } else if (options.FixedStep()) {
+        runCapture(scene, options);
+    } else {
+        double lastFrameTime = glfwGetTime();
+        while (!ShouldQuit()) {
+            glfwPollEvents();
+            double now = glfwGetTime();
+            flyFromKeys(GetGLFWWindow(), static_cast<float>(std::min(now - lastFrameTime, static_cast<double>(MAX_FRAME_SECONDS))));
+            lastFrameTime = now;
+            scene->UpdateTime();
+            renderer->Frame();
+        }
     }
 
     vkDeviceWaitIdle(device->GetVkDevice());
@@ -197,6 +303,7 @@ int main() {
     delete renderer;
     delete swapChain;
     delete device;
+    vkDestroySurfaceKHR(instance->GetVkInstance(), surface, nullptr);
     delete instance;
     DestroyWindow();
     return 0;

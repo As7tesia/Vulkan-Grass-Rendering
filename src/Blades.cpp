@@ -1,17 +1,19 @@
 #include <vector>
 #include "Blades.h"
 #include "BufferUtils.h"
+#include "Instance.h"
 
 float generateRandomFloat() {
     return rand() / (float)RAND_MAX;
 }
 
-Blades::Blades(Device* device, VkCommandPool commandPool, const Terrain& terrain) : Model(device, commandPool, {}, {}) {
+Blades::Blades(Device* device, VkCommandPool commandPool, const Terrain& terrain, unsigned int count, bool hostVisibleCulled)
+    : Model(device, commandPool, {}, {}), count(count) {
     std::vector<Blade> blades;
-    blades.reserve(NUM_BLADES);
+    blades.reserve(count);
     float size = terrain.GetSize();
 
-    while (blades.size() < NUM_BLADES) {
+    while (blades.size() < count) {
         float x = (generateRandomFloat() - 0.5f) * size;
         float z = (generateRandomFloat() - 0.5f) * size;
         float lushness = terrain.LushnessAt(x, z);
@@ -48,14 +50,31 @@ Blades::Blades(Device* device, VkCommandPool commandPool, const Terrain& terrain
     }
 
     BladeDrawIndirect indirectDraw;
-    indirectDraw.vertexCount = NUM_BLADES;
+    indirectDraw.vertexCount = count;
     indirectDraw.instanceCount = 1;
     indirectDraw.firstVertex = 0;
     indirectDraw.firstInstance = 0;
 
-    BufferUtils::CreateBufferFromData(device, commandPool, blades.data(), NUM_BLADES * sizeof(Blade), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, bladesBuffer, bladesBufferMemory);
-    BufferUtils::CreateBuffer(device, NUM_BLADES * sizeof(Blade), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, culledBladesBuffer, culledBladesBufferMemory);
-    BufferUtils::CreateBufferFromData(device, commandPool, &indirectDraw, sizeof(BladeDrawIndirect), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, numBladesBuffer, numBladesBufferMemory);
+    VkDeviceSize bufferSize = static_cast<VkDeviceSize>(count) * sizeof(Blade);
+    VkMemoryPropertyFlags culledMemory = hostVisibleCulled ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    BufferUtils::CreateBufferFromData(device, commandPool, blades.data(), bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, bladesBuffer, bladesBufferMemory);
+    BufferUtils::CreateBuffer(device, bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, culledMemory, culledBladesBuffer, culledBladesBufferMemory);
+
+    VkMemoryRequirements requirements;
+    vkGetBufferMemoryRequirements(device->GetVkDevice(), culledBladesBuffer, &requirements);
+    VkPhysicalDeviceMemoryProperties memoryProperties;
+    vkGetPhysicalDeviceMemoryProperties(device->GetInstance()->GetPhysicalDevice(), &memoryProperties);
+    culledMemoryFlags = memoryProperties.memoryTypes[device->GetInstance()->GetMemoryTypeIndex(requirements.memoryTypeBits, culledMemory)].propertyFlags;
+    // TRANSFER_SRC lets bench runs read back the drawn blade count
+    BufferUtils::CreateBufferFromData(device, commandPool, &indirectDraw, sizeof(BladeDrawIndirect), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, numBladesBuffer, numBladesBufferMemory);
+}
+
+unsigned int Blades::GetCount() const {
+    return count;
+}
+
+VkMemoryPropertyFlags Blades::GetCulledMemoryFlags() const {
+    return culledMemoryFlags;
 }
 
 VkBuffer Blades::GetBladesBuffer() const {

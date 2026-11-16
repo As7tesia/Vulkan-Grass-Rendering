@@ -5,11 +5,31 @@
 #include "Blades.h"
 #include "Camera.h"
 #include "Image.h"
+#include "BufferUtils.h"
+
+#include <algorithm>
+#include <vector>
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
 
 static constexpr unsigned int WORKGROUP_SIZE = 32;
+// the minimum maxComputeWorkGroupCount[0] Vulkan guarantees
+static constexpr uint32_t MAX_WORKGROUPS_X = 65535;
 
-Renderer::Renderer(Device* device, SwapChain* swapChain, Scene* scene, Camera* camera)
-  : device(device),
+namespace {
+    enum Timestamp : uint32_t {
+        COMPUTE_BEGIN,
+        COMPUTE_END,
+        GRAPHICS_BEGIN,
+        TERRAIN_END,
+        GRASS_END,
+        TIMESTAMP_COUNT
+    };
+}
+
+Renderer::Renderer(Device* device, SwapChain* swapChain, Scene* scene, Camera* camera, const Options& options)
+  : options(options),
+    device(device),
     logicalDevice(device->GetVkDevice()),
     swapChain(swapChain),
     scene(scene),
@@ -31,8 +51,29 @@ Renderer::Renderer(Device* device, SwapChain* swapChain, Scene* scene, Camera* c
     CreateGraphicsPipeline();
     CreateGrassPipeline();
     CreateComputePipeline();
+    if (options.bench) {
+        CreateBenchResources();
+    }
     RecordCommandBuffers();
     RecordComputeCommandBuffer();
+}
+
+void Renderer::CreateBenchResources() {
+    VkQueryPoolCreateInfo poolInfo = {};
+    poolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    poolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    poolInfo.queryCount = TIMESTAMP_COUNT;
+    if (vkCreateQueryPool(logicalDevice, &poolInfo, nullptr, &timestampPool) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create timestamp query pool");
+    }
+
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(device->GetInstance()->GetPhysicalDevice(), &properties);
+    timestampPeriodMs = properties.limits.timestampPeriod * 1e-6;
+
+    BufferUtils::CreateBuffer(device, sizeof(uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, drawnCountBuffer, drawnCountMemory);
+    vkMapMemory(logicalDevice, drawnCountMemory, 0, sizeof(uint32_t), 0, reinterpret_cast<void**>(&drawnCountMapped));
 }
 
 void Renderer::CreateCommandPools() {
@@ -815,6 +856,22 @@ void Renderer::CreateComputePipeline() {
     computeShaderStageInfo.module = computeShaderModule;
     computeShaderStageInfo.pName = "main";
 
+    // constant_id order in compute.comp
+    std::array<VkBool32, 6> switches = {
+        options.subgroupCompaction, options.orientationCulling, options.frustumCulling,
+        options.distanceCulling, options.forces, options.wind
+    };
+    std::array<VkSpecializationMapEntry, 6> entries;
+    for (uint32_t i = 0; i < entries.size(); ++i) {
+        entries[i] = { i, i * static_cast<uint32_t>(sizeof(VkBool32)), sizeof(VkBool32) };
+    }
+    VkSpecializationInfo specialization = {};
+    specialization.mapEntryCount = static_cast<uint32_t>(entries.size());
+    specialization.pMapEntries = entries.data();
+    specialization.dataSize = sizeof(switches);
+    specialization.pData = switches.data();
+    computeShaderStageInfo.pSpecializationInfo = &specialization;
+
     std::vector<VkDescriptorSetLayout> descriptorSetLayouts = { cameraDescriptorSetLayout, timeDescriptorSetLayout, computeDescriptorSetLayout };
 
     // Create pipeline layout
@@ -981,15 +1038,24 @@ void Renderer::RecordComputeCommandBuffer() {
     // Bind descriptor set for time uniforms
     vkCmdBindDescriptorSets(computeCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipelineLayout, 1, 1, &timeDescriptorSet, 0, nullptr);
 
-    // the previous frame's dispatch wrote these buffers and its draw read them
+    // runs first each frame, so it also resets the graphics pass's queries
+    if (timestampPool != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(computeCommandBuffer, timestampPool, 0, TIMESTAMP_COUNT);
+    }
+
+    // the previous frame's dispatch wrote these buffers, its draw read them, and a bench run copied the count out
     VkMemoryBarrier frameBarrier = {};
     frameBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     frameBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     frameBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     vkCmdPipelineBarrier(computeCommandBuffer,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 1, &frameBarrier, 0, nullptr, 0, nullptr);
+
+    if (timestampPool != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(computeCommandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestampPool, COMPUTE_BEGIN);
+    }
 
     // zero vertexCount, the first field of BladeDrawIndirect
     for (uint32_t i = 0; i < scene->GetBlades().size(); ++i) {
@@ -1005,7 +1071,13 @@ void Renderer::RecordComputeCommandBuffer() {
 
     for (uint32_t i = 0; i < scene->GetBlades().size(); ++i) {
         vkCmdBindDescriptorSets(computeCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipelineLayout, 2, 1, &computeDescriptorSets[i], 0, nullptr);
-        vkCmdDispatch(computeCommandBuffer, (NUM_BLADES + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE, 1, 1);
+        uint32_t groups = (scene->GetBlades()[i]->GetCount() + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+        uint32_t groupsX = std::min(groups, MAX_WORKGROUPS_X);
+        vkCmdDispatch(computeCommandBuffer, groupsX, (groups + groupsX - 1) / groupsX, 1);
+    }
+
+    if (timestampPool != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(computeCommandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestampPool, COMPUTE_END);
     }
 
     // ~ End recording ~
@@ -1076,6 +1148,10 @@ void Renderer::RecordCommandBuffers() {
         // Bind the camera descriptor set. This is set 0 in all pipelines so it will be inherited
         vkCmdBindDescriptorSets(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipelineLayout, 0, 1, &cameraDescriptorSet, 0, nullptr);
 
+        if (timestampPool != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp(commandBuffers[i], VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestampPool, GRAPHICS_BEGIN);
+        }
+
         vkCmdBeginRenderPass(commandBuffers[i], &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
         // Bind the graphics pipeline
@@ -1097,6 +1173,10 @@ void Renderer::RecordCommandBuffers() {
             vkCmdDrawIndexed(commandBuffers[i], static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
         }
 
+        if (timestampPool != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp(commandBuffers[i], VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestampPool, TERRAIN_END);
+        }
+
         // Bind the grass pipeline
         vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, grassPipeline);
 
@@ -1112,8 +1192,29 @@ void Renderer::RecordCommandBuffers() {
             vkCmdDrawIndirect(commandBuffers[i], scene->GetBlades()[j]->GetNumBladesBuffer(), 0, 1, sizeof(BladeDrawIndirect));
         }
 
+        if (timestampPool != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp(commandBuffers[i], VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestampPool, GRASS_END);
+        }
+
         // End render pass
         vkCmdEndRenderPass(commandBuffers[i]);
+
+        if (drawnCountBuffer != VK_NULL_HANDLE && !scene->GetBlades().empty()) {
+            VkMemoryBarrier toCopy = {};
+            toCopy.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            toCopy.srcAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+            toCopy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(commandBuffers[i], VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &toCopy, 0, nullptr, 0, nullptr);
+
+            VkBufferCopy region = { 0, 0, sizeof(uint32_t) };
+            vkCmdCopyBuffer(commandBuffers[i], scene->GetBlades()[0]->GetNumBladesBuffer(), drawnCountBuffer, 1, &region);
+
+            VkMemoryBarrier toHost = {};
+            toHost.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            toHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            toHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            vkCmdPipelineBarrier(commandBuffers[i], VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &toHost, 0, nullptr, 0, nullptr);
+        }
 
         // ~ End recording ~
         if (vkEndCommandBuffer(commandBuffers[i]) != VK_SUCCESS) {
@@ -1122,7 +1223,7 @@ void Renderer::RecordCommandBuffers() {
     }
 }
 
-void Renderer::Frame() {
+void Renderer::Frame(const char* capturePath) {
 
     VkSubmitInfo computeSubmitInfo = {};
     computeSubmitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1160,13 +1261,123 @@ void Renderer::Frame() {
         throw std::runtime_error("Failed to submit draw command buffer");
     }
 
+    // the image is still ours until it is presented
+    if (capturePath != nullptr) {
+        vkQueueWaitIdle(device->GetQueue(QueueFlags::Graphics));
+        CaptureImage(swapChain->GetVkImage(swapChain->GetIndex()), capturePath);
+    }
+
     if (!swapChain->Present()) {
         RecreateFrameResources();
     }
 }
 
+GpuTimings Renderer::ReadTimings() {
+    uint64_t ticks[TIMESTAMP_COUNT];
+    vkGetQueryPoolResults(logicalDevice, timestampPool, 0, TIMESTAMP_COUNT, sizeof(ticks), ticks, sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    GpuTimings timings;
+    timings.compute = (ticks[COMPUTE_END] - ticks[COMPUTE_BEGIN]) * timestampPeriodMs;
+    timings.terrain = (ticks[TERRAIN_END] - ticks[GRAPHICS_BEGIN]) * timestampPeriodMs;
+    timings.grass = (ticks[GRASS_END] - ticks[TERRAIN_END]) * timestampPeriodMs;
+    return timings;
+}
+
+uint32_t Renderer::ReadDrawnBladeCount() {
+    vkDeviceWaitIdle(logicalDevice);
+    return *drawnCountMapped;
+}
+
+void Renderer::CaptureImage(VkImage image, const char* path) {
+    VkExtent2D extent = swapChain->GetVkExtent();
+    VkDeviceSize size = static_cast<VkDeviceSize>(extent.width) * extent.height * 4;
+
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    BufferUtils::CreateBuffer(device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, buffer, memory);
+
+    VkCommandBufferAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandPool = graphicsCommandPool;
+    allocInfo.commandBufferCount = 1;
+    VkCommandBuffer commandBuffer;
+    vkAllocateCommandBuffers(logicalDevice, &allocInfo, &commandBuffer);
+
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+    VkImageMemoryBarrier toTransfer = {};
+    toTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    toTransfer.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toTransfer.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.image = image;
+    toTransfer.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &toTransfer);
+
+    VkBufferImageCopy region = {};
+    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.imageExtent = { extent.width, extent.height, 1 };
+    vkCmdCopyImageToBuffer(commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &region);
+
+    VkImageMemoryBarrier toPresent = toTransfer;
+    toPresent.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toPresent.dstAccessMask = 0;
+    toPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    VkMemoryBarrier toHost = {};
+    toHost.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    toHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+        0, 1, &toHost, 0, nullptr, 1, &toPresent);
+
+    vkEndCommandBuffer(commandBuffer);
+
+    VkSubmitInfo submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+    vkQueueSubmit(device->GetQueue(QueueFlags::Graphics), 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(device->GetQueue(QueueFlags::Graphics));
+    vkFreeCommandBuffers(logicalDevice, graphicsCommandPool, 1, &commandBuffer);
+
+    const uint8_t* mapped;
+    vkMapMemory(logicalDevice, memory, 0, size, 0, (void**)&mapped);
+    VkFormat format = swapChain->GetVkImageFormat();
+    bool bgra = format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+    std::vector<uint8_t> rgb(static_cast<size_t>(extent.width) * extent.height * 3);
+    for (size_t p = 0; p < rgb.size() / 3; ++p) {
+        rgb[3 * p + 0] = mapped[4 * p + (bgra ? 2 : 0)];
+        rgb[3 * p + 1] = mapped[4 * p + 1];
+        rgb[3 * p + 2] = mapped[4 * p + (bgra ? 0 : 2)];
+    }
+    vkUnmapMemory(logicalDevice, memory);
+    vkDestroyBuffer(logicalDevice, buffer, nullptr);
+    vkFreeMemory(logicalDevice, memory, nullptr);
+
+    if (!stbi_write_png(path, extent.width, extent.height, 3, rgb.data(), extent.width * 3)) {
+        throw std::runtime_error(std::string("Failed to write ") + path);
+    }
+}
+
 Renderer::~Renderer() {
     vkDeviceWaitIdle(logicalDevice);
+
+    if (timestampPool != VK_NULL_HANDLE) {
+        vkDestroyQueryPool(logicalDevice, timestampPool, nullptr);
+        vkUnmapMemory(logicalDevice, drawnCountMemory);
+        vkDestroyBuffer(logicalDevice, drawnCountBuffer, nullptr);
+        vkFreeMemory(logicalDevice, drawnCountMemory, nullptr);
+    }
 
     vkFreeCommandBuffers(logicalDevice, graphicsCommandPool, static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
     vkFreeCommandBuffers(logicalDevice, computeCommandPool, 1, &computeCommandBuffer);

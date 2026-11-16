@@ -5,7 +5,6 @@
 #include "Model.h"
 #include "Terrain.h"
 
-constexpr static unsigned int NUM_BLADES = 1 << 20;
 constexpr static float MIN_HEIGHT = 1.3f;
 constexpr static float MAX_HEIGHT = 2.5f;
 constexpr static float MIN_WIDTH = 0.1f;
@@ -80,8 +79,14 @@ private:
     VkDeviceMemory culledBladesBufferMemory;
     VkDeviceMemory numBladesBufferMemory;
 
+    unsigned int count;
+    VkMemoryPropertyFlags culledMemoryFlags;
+
 public:
-    Blades(Device* device, VkCommandPool commandPool, const Terrain& terrain);
+    Blades(Device* device, VkCommandPool commandPool, const Terrain& terrain, unsigned int count, bool hostVisibleCulled);
+    unsigned int GetCount() const;
+    // flags of the memory type the culled buffer landed in
+    VkMemoryPropertyFlags GetCulledMemoryFlags() const;
     VkBuffer GetBladesBuffer() const;
     VkBuffer GetCulledBladesBuffer() const;
     VkBuffer GetNumBladesBuffer() const;

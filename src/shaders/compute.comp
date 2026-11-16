@@ -40,15 +40,18 @@ layout(set = 2, binding = 2, std430) buffer NumBlades {
 #define GRAVITY 9.8
 #define WIND_STRENGTH 6.0
 
-// set to 0 to turn a feature off
-#define SUBGROUP_COMPACTION 1   // warp aggregated atomic ballot
-#define ORIENTATION_CULLING 1
-#define FRUSTUM_CULLING 1
-#define DISTANCE_CULLING 1
+// set from the command line; see Options.h
+layout(constant_id = 0) const bool SUBGROUP_COMPACTION = true;  // warp aggregated atomic ballot
+layout(constant_id = 1) const bool ORIENTATION_CULLING = true;
+layout(constant_id = 2) const bool FRUSTUM_CULLING = true;
+layout(constant_id = 3) const bool DISTANCE_CULLING = true;
+layout(constant_id = 4) const bool FORCES = true;
+layout(constant_id = 5) const bool WIND = true;
 
 #define ORIENTATION_THRESHOLD 0.9
 #define FRUSTUM_TOLERANCE 0.1
-#define MAX_DISTANCE 60.0
+#define FULL_DENSITY_DISTANCE 15.0  // meters of ground distance kept at full density
+#define MAX_DISTANCE 120.0
 #define DISTANCE_BUCKETS 10
 
 bool inBounds(float value, float bounds) {
@@ -80,7 +83,8 @@ void windAt(vec2 p, float t, out vec3 direction, out float strength) {
 
 void main() {
 	// vertexCount is zeroed by vkCmdFillBuffer before this dispatch
-	uint index = gl_GlobalInvocationID.x;
+	// 2D dispatch past 65535 workgroups
+	uint index = gl_GlobalInvocationID.y * gl_NumWorkGroups.x * gl_WorkGroupSize.x + gl_GlobalInvocationID.x;
 	if (index >= blades.length()) {
 		return;
 	}
@@ -94,81 +98,86 @@ void main() {
 	float height = blade.v1.w;
 	float stiffness = blade.up.w;
 
-	// prevent overshooting at high dt
-	float dt = min(deltaTime, 0.05);
-
-	// forces
 	vec3 t1 = vec3(cos(orientation), 0.0, sin(orientation));
-	vec3 front = normalize(cross(t1, up));
-	vec3 gravity = vec3(0.0, -GRAVITY, 0.0) + 0.25 * GRAVITY * front;
 
-	vec3 recovery = (v0 + up * height - v2) * stiffness;
+	if (FORCES) {
+		// prevent overshooting at high dt
+		float dt = min(deltaTime, 0.05);
 
-	vec3 windDirection;
-	float windStrength;
-	windAt(v0.xz, totalTime, windDirection, windStrength);
-	float directionalAlignment = 1.0 - abs(dot(windDirection, normalize(v2 - v0)));
-	float heightRatio = dot(v2 - v0, up) / height;
-	vec3 wind = windDirection * windStrength * directionalAlignment * heightRatio;
+		// forces
+		vec3 front = normalize(cross(t1, up));
+		vec3 gravity = vec3(0.0, -GRAVITY, 0.0) + 0.25 * GRAVITY * front;
 
-	v2 += (gravity + recovery + wind) * dt;
+		vec3 recovery = (v0 + up * height - v2) * stiffness;
 
-	// state validation
-	v2 -= up * min(dot(up, v2 - v0), 0.0);
+		vec3 wind = vec3(0.0);
+		if (WIND) {
+			vec3 windDirection;
+			float windStrength;
+			windAt(v0.xz, totalTime, windDirection, windStrength);
+			float directionalAlignment = 1.0 - abs(dot(windDirection, normalize(v2 - v0)));
+			float heightRatio = dot(v2 - v0, up) / height;
+			wind = windDirection * windStrength * directionalAlignment * heightRatio;
+		}
 
-	float lproj = length(v2 - v0 - up * dot(v2 - v0, up));
-	v1 = v0 + height * up * max(1.0 - lproj / height, 0.05 * max(lproj / height, 1.0));
+		v2 += (gravity + recovery + wind) * dt;
 
-	// degree-2 curve length estimate
-	float L0 = distance(v2, v0);
-	float L1 = distance(v2, v1) + distance(v1, v0);
-	float r = height / ((2.0 * L0 + L1) / 3.0);
-	vec3 v1Corrected = v0 + r * (v1 - v0);
-	v2 = v1Corrected + r * (v2 - v1);
-	v1 = v1Corrected;
+		// state validation
+		v2 -= up * min(dot(up, v2 - v0), 0.0);
 
-	blade.v1.xyz = v1;
-	blade.v2.xyz = v2;
-	blades[index] = blade;
+		float lproj = length(v2 - v0 - up * dot(v2 - v0, up));
+		v1 = v0 + height * up * max(1.0 - lproj / height, 0.05 * max(lproj / height, 1.0));
+
+		// degree-2 curve length estimate
+		float L0 = distance(v2, v0);
+		float L1 = distance(v2, v1) + distance(v1, v0);
+		float r = height / ((2.0 * L0 + L1) / 3.0);
+		vec3 v1Corrected = v0 + r * (v1 - v0);
+		v2 = v1Corrected + r * (v2 - v1);
+		v1 = v1Corrected;
+
+		blade.v1.xyz = v1;
+		blade.v2.xyz = v2;
+		blades[index] = blade;
+	}
 
 	// view is rigid, so its inverse translation is -R^T * t
 	vec3 cameraPosition = -transpose(mat3(camera.view)) * camera.view[3].xyz;
 	bool visible = true;
 
-#if ORIENTATION_CULLING
-	// edge-on: looking along the width direction
-	vec3 viewDirection = normalize(v0 - cameraPosition);
-	visible = visible && abs(dot(viewDirection, t1)) < ORIENTATION_THRESHOLD;
-#endif
-
-#if FRUSTUM_CULLING
-	mat4 viewProj = camera.proj * camera.view;
-	vec3 midpoint = 0.25 * v0 + 0.5 * v1 + 0.25 * v2;
-	visible = visible && (inFrustum(v0, viewProj) || inFrustum(midpoint, viewProj) || inFrustum(v2, viewProj));
-#endif
-
-#if DISTANCE_CULLING
-	// keep fewer buckets of blades as ground-plane distance grows, none past MAX_DISTANCE
-	vec3 toBlade = v0 - cameraPosition;
-	float groundDistance = length(toBlade - up * dot(toBlade, up));
-	float keptBuckets = floor(DISTANCE_BUCKETS * (1.0 - groundDistance / MAX_DISTANCE));
-	visible = visible && float(index % DISTANCE_BUCKETS) <= keptBuckets;
-#endif
-
-#if SUBGROUP_COMPACTION
-	// one atomic per subgroup: the first lane reserves room for every visible lane
-	uvec4 ballot = subgroupBallot(visible);
-	uint base = 0;
-	if (subgroupElect()) {
-		base = atomicAdd(numBlades.vertexCount, subgroupBallotBitCount(ballot));
+	if (ORIENTATION_CULLING) {
+		// edge-on: looking along the width direction
+		vec3 viewDirection = normalize(v0 - cameraPosition);
+		visible = visible && abs(dot(viewDirection, t1)) < ORIENTATION_THRESHOLD;
 	}
-	base = subgroupBroadcastFirst(base);
-	if (visible) {
-		culledBlades[base + subgroupBallotExclusiveBitCount(ballot)] = blade;
+
+	if (FRUSTUM_CULLING) {
+		mat4 viewProj = camera.proj * camera.view;
+		vec3 midpoint = 0.25 * v0 + 0.5 * v1 + 0.25 * v2;
+		visible = visible && (inFrustum(v0, viewProj) || inFrustum(midpoint, viewProj) || inFrustum(v2, viewProj));
 	}
-#else
-	if (visible) {
+
+	if (DISTANCE_CULLING) {
+		// one bucket fewer at each of 9 evenly spaced steps between FULL_DENSITY_DISTANCE and MAX_DISTANCE, none past it
+		vec3 toBlade = v0 - cameraPosition;
+		float groundDistance = length(toBlade - up * dot(toBlade, up));
+		float fade = clamp((groundDistance - FULL_DENSITY_DISTANCE) / (MAX_DISTANCE - FULL_DENSITY_DISTANCE), 0.0, 1.0);
+		float keptBuckets = ceil(DISTANCE_BUCKETS * (1.0 - fade));
+		visible = visible && groundDistance < MAX_DISTANCE && float(index % DISTANCE_BUCKETS) < keptBuckets;
+	}
+
+	if (SUBGROUP_COMPACTION) {
+		// one atomic per subgroup: the first lane reserves room for every visible lane
+		uvec4 ballot = subgroupBallot(visible);
+		uint base = 0;
+		if (subgroupElect()) {
+			base = atomicAdd(numBlades.vertexCount, subgroupBallotBitCount(ballot));
+		}
+		base = subgroupBroadcastFirst(base);
+		if (visible) {
+			culledBlades[base + subgroupBallotExclusiveBitCount(ballot)] = blade;
+		}
+	} else if (visible) {
 		culledBlades[atomicAdd(numBlades.vertexCount, 1)] = blade;
 	}
-#endif
 }

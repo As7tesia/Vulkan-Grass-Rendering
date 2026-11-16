@@ -47,7 +47,9 @@ public:
     void SetViewport(int width, int height);
     // pivot on target
     void SetHome(const glm::vec3& eye, const glm::vec3& target);
+    void SetHome(const ViewportPose& home);
     void ResetToHome();
+    const ViewportPose& GetPose() const;
     void SetFlySpeed(float unitsPerSecond);
     void ScaleFlySpeed(float wheelNotches);
 
